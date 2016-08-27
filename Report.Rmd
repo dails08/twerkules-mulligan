@@ -1,0 +1,187 @@
+---
+title: "Uber Data Challenge"
+author: "Chris Dailey"
+output: word_document
+---
+
+```{r echo = FALSE}
+decompose_timeseries = function(ts, histobj){
+  ts.decomp.add = decompose(ts)
+  ts.decomp.add.df = data.frame(
+    bucket = histobj$Bucket,
+    observed = ts.decomp.add$x, 
+    seasonal = ts.decomp.add$seasonal,
+    trend = ts.decomp.add$trend,
+    random = ts.decomp.add$random,
+    weekend = histobj$Weekend)
+  ts.graph.observed = ggplot(ts.decomp.add.df, aes(bucket, observed, color = weekend, group = 1)) + geom_line(size = 1) + scale_x_datetime() + labs(x="")
+  ts.graph.trend = ggplot(ts.decomp.add.df, aes(bucket, trend, color = weekend, group = 1)) + geom_line(size = 1) + scale_x_datetime() + labs(x="")
+  ts.graph.seasonal = ggplot(ts.decomp.add.df, aes(bucket, seasonal, color = weekend, group = 1)) + geom_line(size = 1) + scale_x_datetime() + labs(x="")
+  ts.graph.random = ggplot(ts.decomp.add.df, aes(bucket, random, color = weekend, group = 1)) + geom_line(size = 1) + scale_x_datetime() + labs(x="Date, Time")
+  return(grid.arrange(ts.graph.observed, ts.graph.trend, ts.graph.seasonal, ts.graph.random, ncol=1, top = "Decomposed Additive TS"))
+}
+
+```
+
+  As Chapter 2 of the *Chris Dailey Applies for a Job* straight-to-DVD miniseries, our hero must demonstrate worth by executing some quality data science to prove he isn't making stuff up.  
+
+  Part 1 consists of some basic data manipulation and time series analysis.  Part 2 is about experimental design.  Finally, Part 3 is about predictive modeling.  
+  
+  We begin with Part 1, our hero already neck-deep in science...
+  
+## Part 1: Time Series Analysis
+
+The task: given a dataset of timestamps representing login times, discover the underlying patterns and discuss any data issues.
+
+First, we set up our environment and load the data.
+
+```{r setup, warning = FALSE}
+library(rjson)
+library(ggplot2)
+library(grid)
+library(gridExtra)
+library(scales)
+
+raw_data = fromJSON(file = "logins (3).json")
+str(raw_data)
+```
+
+Modify the data a bit to make it more convenient.  Since nothing is nested there's no need to work in json.
+
+```{r wrangling-1}
+timestamps = as.POSIXlt(raw_data$login_time)
+length(timestamps)
+max(timestamps) - min(timestamps)
+head(timestamps, n=20)
+```
+
+  The data speaks.  A little over 93k datapoints covering about 102 days in a standard format.  The months, dates, and times all seem fine, but the year is suspicious.  This is common for systems that don't record the year; in most cases, *nix systems will default to the epoch, Jan 1 1970, when parts of a date are missing.  This means the year portion of the data is meaningless and will be something of an issue later as it will limit our ability to figure out which day of the week a timestamp is from.  The prompt specifies that the timestamps are all taken from a specific location, so the time zone can also be ignored.
+  
+  We'll bucket the data to allow for time series analysis.  We'll also chop it up a bit and format it some to make it easier to work with.
+  
+```{r formatting}
+#Mark out the range of coverage
+start_time = min(timestamps)
+end_time = max(timestamps)
+#define the bins
+buckets = seq.POSIXt(from = start_time, to = end_time, by = "15 min")
+#Bin, tabulate, and convert to a data frame
+hist1 = data.frame(table(cut.POSIXt(timestamps, buckets)))
+names(hist1) = c("Bucket", "Logins")
+#Format the time
+hist1$Bucket = as.POSIXlt(hist1$Bucket)
+#Mark weekends (Fri, Sat, Sun) for easier distinction
+hist1$Weekend = hist1$Bucket$wday %in% c(5,6,0)
+```
+
+  The first step is always to look at the data. A high resolution version is included as TODO Attachment 1. 
+  
+```{r first-look, fig.width=10, fig.height=2}
+ggplot(hist1, aes(Bucket, Logins, color = Weekend, group = 1), size = 1) + geom_line() + scale_x_datetime() + labs(x="Time", title="Logins per 15 Minutes")
+```
+
+We see some trends that shouldn't surprise.  A spike each day with higher spikes during the weekends.  It also appears that usage is increasing in general over the covered period.  We'll quantify the three trends: daily, weekly and longterm.  First, though, we'll review the theoretical basis for our analysis.
+
+###Time Series Basics
+
+Feel free to skip this part if you'd rather avoid the mathematical side of life.
+
+We represent a time series of length $n$ by $\{x_t : t = 1,..., n\} = \{x_1, x_2,...,x_n\}$.  It consists of $n$ values sampled at discrete times $1, 2,...,n$.  The notation will be abbreviated to $\{x_t\}$ when the length $n$ of a series doesn't need to be specified.  
+
+We expect this series to be dominated by trends and seasonal effects.  We can isolate each component: the trend, the seasonal effect, and the underlying stochastic process (the "random").  We can decompose this in two ways.  An additive decomposition is expressed mathematically as
+
+$$x_t = m_t + s_t + z_t$$
+
+where, at time $t$, $x_t$ is the observed series, $m_t$ is the trend, $s_t$ is the seasonal effect, and $z_t$ is the error term representing the stochastic component (a series of random variables with mean zero).
+
+If the seasonal effect depends on the trend, a multiplicative decomposition is appropriate:
+
+$$x_t = m_t * s_t + z_t$$
+
+Findind the seasonal effect and separating it from the trend depends on the period ($k$)of the phenomenon we expect to find.  We simply calculate a moving average over a span of $k$ observations. TODO add footnote about odd/even/integer spans.  For example, if we expect to find a weekly trend across daily observations, we could estimate the trend as:
+
+$$\hat{m}_t = \frac{x_{t-3} + x_{t-2} + x_{t-1} + x_t + x_{t+1} + x_{t+2} + x_{t+3}}{7}$$
+
+Note the ^ above the m indicating an estimation.  Once we have the estimated trend, the estimated additive seasonal effect can be derived by subtracting the trend:
+
+$$\hat{s}_t = x_t - \hat{m}_t$$
+
+Finally, the stochastic component is all that's left when the trend and seasonal effects are subtracted from the observed series.  Ideally, this remaining component will be white noise, i.e, a series of random values with mean zero and constant variance with no dependence on previous observations.  If it's not, some variance is not captured by our model.  That won't stop us from deriving meaningful insights, but it will limit our ability to make predictions from our model.  We should also be aware of the unaccounted for variance when assigning causality.  There are procedures and models to account for this, but beyond the basic insights of the model we won't need them to reach our goals.
+
+
+###Daily Trends
+
+To look at daily trends, we assign our time series a period of $4 * 24$, since we have 4 observations per hour and there are 24 hours in a day and we want to recover daily trends.  We decompose the time series and take a look at our trends.  TODO A high resolution render of this chart is included as Attachment 2.
+
+```{r,  daily-trends, fig.width=10, fig.height=8, warning=FALSE, message=FALSE}
+#build a time series
+ts1 = ts(data = hist1$Logins, start = c(1,1), frequency = (4 * 24))
+#this is a function defined at the end of the report
+decompose_timeseries(ts1, hist1)
+```
+
+When viewed at a daily scale, the results make sense.  The seasonal trend indicates two spikes a day, one larger than the other.  The trend shows that weekends are much busier as expected, and that the spikes on weekend days are bigger than the spikes during the week.  There are two major concerns with this model.  First, the seasonal effects don't differentiate between weekdays and weekends which are intuitively and empirically different, so trends that might be specific to each are lost.  Second, the random component, while nicely centered at zero, does not resemble white noise; there is unaccounted for variance.  Further, the unaccounted for variance is quite large; the random component is much larger than the seasonal effects which limits our ability to make predictions, empirical or intuitive.
+
+We will leave the second largely unaddressed.  We'll see that it becomes less significant when we account for specific trends and while we'll briefly demonstrate a means of correcting it, we won't pursue it much.  Also, it could simply be that there is a non-stochastic variable driving change; for example, spring break might induce an influx of tourists; the seasonal effect of the day of the week would not account for this.
+
+Easily addressible, though, is the distinction between weekdays and weekends.  There are several ways to approach this, but we'll use the most straightforward for now: widening the period to a week will allow our seasonal effects to account for the distinction between weekdays and weekends.
+
+###Weekly Trends
+
+```{r, weekly-trends, fig.width=10, fig.height=8, warning=FALSE, message=FALSE}
+#note the increased frequency
+ts2 = ts(data = hist1$Logins, start = c(1,1), frequency = (4 * 24 * 7))
+decompose_timeseries(ts2, hist1)
+```
+
+Now we see some things previously hidden in the data!  First, we notice that in the long term, usage is indeed increasing, and by quite a lot.  Second, and here's what we came for,our seasonal effects capture the difference between weekdays and weekends.  This will allow us to identify typical usage patterns on weekdays and weekends, which we'll attend to in a moment.  First, we must address the random component; it is still not white noise and the variance doesn't seem constant.  If we were to build a model for this, we would first prove to ourselves that the random component wasn't white noise by reviewing its partial self-correlation.  The moving trend implies a non-stationary series and the changing variance plus the self-correlation we'd certainly find implies a GARCH model would make the most sense.  In this case, though, we needn't build a model, just notice trends.
+
+Let's look more closely at the weekly usage patterns on a day-to-day basis.  A high resolution render of this chart is included as TODO Attachment 3.
+
+```{r, seasonal-focus, fig.width=8, fig.height=5}
+#break down the series into components
+ts2.decomp.add = decompose(ts2)
+#format it for easy use
+ts2.seasonal = data.frame(bucket=hist1$Bucket, seasonal = ts2.decomp.add$seasonal)
+#extract just one week and format it
+one_week = ts2.seasonal[0:(7*24*4),]
+one_week$bucket = as.POSIXlt(one_week$bucket)
+one_week$Weekday = weekdays(one_week$bucket)
+one_week$Weekday = factor(one_week$Weekday, levels = c("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"))
+
+#Plot the data
+ggplot(one_week) + 
+  geom_line(aes(bucket, seasonal, color = Weekday, group=1), size=1) + 
+  scale_color_brewer(palette="Set1") + 
+  scale_x_datetime(breaks= date_breaks("6 hours"), minor_breaks = date_breaks("2 hour"), labels = date_format("%H", tz = "EST")) +
+  labs(title="Average Daily Trends", x="Hour of the Day (24H)", y="Trend Difference")
+```
+
+As we saw earlier, weekends and weekdays exhibit different trends.  Weekdays consistently spike at lunch (with a mini spike after, perhaps for the trip back to the office) and from 9pm to 1am.  Weekends show a predictable spike in line with nightlife activity: higher ridership on Friday night around 10:30pm with sustained usage until the main spike when the bars and clubs close around 5am. 
+
+We mentioned earlier about the ambiguity of using a year we know is wrong to determine the day of the week, but the patterns line up in a sensible way, so it's safe to assume we have the days of the week correct.
+
+##Part 2: Experimental Design
+
+##Part 3: Predictive Modeling
+
+###Functions
+
+```{r eval = FALSE}
+decompose_timeseries = function(ts, histobj){
+  ts.decomp.add = decompose(ts)
+  ts.decomp.add.df = data.frame(
+    bucket = histobj$Bucket,
+    observed = ts.decomp.add$x, 
+    seasonal = ts.decomp.add$seasonal,
+    trend = ts.decomp.add$trend,
+    random = ts.decomp.add$random,
+    weekend = histobj$Weekend)
+  ts.graph.observed = ggplot(ts.decomp.add.df, aes(bucket, observed, color = weekend, group = 1)) + geom_line(size = 1) + scale_x_datetime() + labs(x="")
+  ts.graph.trend = ggplot(ts.decomp.add.df, aes(bucket, trend, color = weekend, group = 1)) + geom_line(size = 1) + scale_x_datetime() + labs(x="")
+  ts.graph.seasonal = ggplot(ts.decomp.add.df, aes(bucket, seasonal, color = weekend, group = 1)) + geom_line(size = 1) + scale_x_datetime() + labs(x="")
+  ts.graph.random = ggplot(ts.decomp.add.df, aes(bucket, random, color = weekend, group = 1)) + geom_line(size = 1) + scale_x_datetime() + labs(x="Date, Time")
+  return(grid.arrange(ts.graph.observed, ts.graph.trend, ts.graph.seasonal, ts.graph.random, ncol=1, top = "Decomposed Additive TS"))
+}
+
+```

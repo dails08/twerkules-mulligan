@@ -1,0 +1,172 @@
+---
+title: "Uber Question 3"
+output: word_document
+---
+
+We establish our environment and load the data.  An easy issue with the data is that null values or values resulting from math errors (like dividing by zero) were listed as NaN without quotes.  This is an issue, as R expects NULL or NA values.  I used the search and replace functionality of a text editor to switch the NaN values to "NA" so R would load the data with no problems.
+
+```{r warning = FALSE, message = FALSE}
+library(jsonlite)
+library(ggplot2)
+library(reshape2)
+library(class)
+
+raw_data = fromJSON(txt = "uber_data_challenge v2.json")
+#format the dates as dates
+raw_data$signup_date = as.POSIXct(raw_data$signup_date)
+raw_data$last_trip_date = as.POSIXct(raw_data$last_trip_date)
+```
+
+Next we establish some useful variables.  Since the prompt defines "active" as having ridden in the last 30 days, we need to know when the data was pulled.  We'll assume the most recent ride was when the data was current and derive activeness from that.
+
+```{r}
+current_date = max(raw_data$last_trip_date)
+record_count = nrow(raw_data)
+
+#establish which users are "active"
+raw_data$active = difftime(current_date, raw_data$last_trip_date, units = "days") < 30
+```
+
+Now that our data is ready to go, we can have a look at it.  We'll check some basic structures, numbers, and distributions.  A high resolution render of this chart is included as TODO Attachment n.
+
+```{r, warning = FALSE, message = FALSE, fig.width = 8, fig.height=8}
+str(raw_data)
+colSums(is.na(raw_data))
+ggplot(melt(raw_data), aes(value)) + geom_histogram(color = "black", fill = "white") + facet_wrap(~variable, scales = "free") + labs(title = "Distribution of variables")
+```
+
+We're actually missing quite a lot of data, from one column in particular: average rating of driver.  It'd be best to avoid using this in our models, so let's just drop that data.
+
+```{r}
+raw_data = raw_data[-4]
+```
+
+Next we must establish a means of comparing models.  There are several ways to do this; accuracy is a simple and intuitive way to measure.  Accuracy is simply the percentage of correct classifications.  This can be troublesome when building models to detect rare occurances, since a model can be extremely accurate by predicting that these rare events never happen, obviously defeating the point of the model.  Depending on whether it's worse to predict an event when there is none, or to predict no event when there is one, other measures can be used to derive maximum usefulness of the model.  For our purposes, though, we'll stick with simple accuracy.
+
+Let's look at the percentage of active riders.  This will give us our prior belief that a rider will be retained and give us a lower bound for our model.
+
+```{r}
+sum(raw_data$active)/length(raw_data$active)
+```
+
+So we're only retaining about 37% of riders.  This means if a model guessed 50/50 at random whether a rider was retained or not, it'd perform at, on average, 37% accuracy.  This is our "random chance" lower bound.  If the model guessed "non-retained" for every datapoint regardless of the data, it'd perform at, on average, 63% accuracy, but wouldn't be very useful, which illustrates the limitations of accuracy as a metric.  .  This is our "effective" lower bound.  Next we'll build a simple non-trivial model for our "practical" lower bound.  We'll pick a few reasonable features and train a logistic regression model on the data and see how it performs.
+
+```{r}
+#shuffle the data
+shuffled_index = sample(seq(1, nrow(raw_data)), replace = FALSE)
+shuffled = raw_data[shuffled_index,]
+
+#split the data into training and test sets for validation
+training_data = shuffled[seq(1, .75*record_count),]
+test_data = shuffled[seq(.75*record_count+1, record_count),]
+nrow(training_data) + nrow(test_data)
+
+#train a model on the training set
+active_model_1 = glm(data = training_data, formula = active ~ trips_in_first_30_days + weekday_pct + avg_dist + avg_rating_by_driver + uber_black_user)
+
+#make predictions against the test set
+preds = predict.glm(active_model_1, newdata = test_data) > .5
+matches = (predict.glm(active_model_1, newdata = test_data) > .5) == test_data$active
+sum(matches, na.rm = TRUE)/length(matches)
+
+#derive the confusion matrix
+confusion_matrix_combinations = data.frame(true_class = test_data$active, pred_class = preds)
+confusion_matrix = table(confusion_matrix_combinations$true_class, confusion_matrix_combinations$pred_class)
+confusion_matrix
+ggplot(confusion_matrix_combinations) + geom_bin2d(aes(true_class, pred_class)) + labs(title="active_model_1 Confusion Matrix", x="True Class", y="Predicted Class")
+```
+
+Our logistic regression model performs at around 67% accuracy.  This is a good practical lower bound; we'll compare future models against this baseline.  Presumably, we want to find riders who would not be retained so we can take steps to retain them.  In this case it's more important that the model doesn't miss rider who would not be retained.  It's possible to "tune" the model to a more lenient standard in order to catch more of the non-retained riders, but this comes at a cost.  Let's look at the tendencies of the model.
+
+```{r}
+confusion_matrix
+#Percentage of non-retained rider correctly identified
+100*confusion_matrix[1,1]/(confusion_matrix[1,1] + confusion_matrix[1,2])
+#Percentage of riders identified as non-retained who are actually not retained
+100*confusion_matrix[1,1]/(confusion_matrix[1,1] + confusion_matrix[2,1])
+```
+
+The model is quite good at recognizing non-retained riders, only missing about 7% of them, but it also has a tendency to identify retained riders as non-retained.  This is a well-known statistical phenomena that makes comparing models difficult, since the same model can perform differently depending on how it's tuned and what's more important.  Fortunately, we can use a diagram called a receiver operating characteristic curve to judge how good a model is across a range of tunings.
+
+``` {r}
+thresholds = seq(0, 1, .05)
+
+results = data.frame(FNR = c(), TNR = c(), TH = c())
+start = proc.time()
+for (threshold in thresholds){
+  preds = predict.glm(active_model_1, newdata = test_data) > threshold
+  matches = (predict.glm(active_model_1, newdata = test_data) > threshold) == test_data$active
+  
+  confusion_matrix_combinations = data.frame(true_class = test_data$active, pred_class = preds)
+  confusion_matrix = table(confusion_matrix_combinations$true_class, confusion_matrix_combinations$pred_class)
+  
+  TNR = confusion_matrix[1,1]/sum(confusion_matrix[1,])
+  FNR = 1 - (confusion_matrix[2,2]/sum(confusion_matrix[2,]))
+  
+  result = data.frame(FNR = c(FNR), TNR = c(TNR), TH = c(threshold))
+  results = rbind(results, result)
+}
+print("Calculation duration:")
+proc.time() - start
+
+ggplot(results) + geom_line(aes(FNR, TNR), size = 1) + geom_abline(slope = 1, intercept = 0, linetype="dashed") + labs(title = "ROC Curve for active_model_1")
+```
+
+Another model we can use is a simple memory-based model called K nearest neighbors (knn).  We can generate a similar curve for it, but knn isn't a probabilistic model, so we won't see a nice curve like with the logistic model.  We can still compare the ranges across which the model classifies based on k, the main parameter.
+
+```{r}
+solid_train_data = na.omit(training_data)
+solid_test_data = na.omit(test_data)
+train_cl = factor(solid_train_data$active)
+test_cl = factor(solid_test_data$active)
+solid_train_data = solid_train_data[c('trips_in_first_30_days','avg_surge','surge_pct','weekday_pct','avg_dist')]
+solid_test_data = solid_test_data[c('trips_in_first_30_days','avg_surge','surge_pct','weekday_pct','avg_dist')]
+
+
+results = knn(solid_train_data, solid_test_data, cl = train_cl, k=3)
+
+thresholds = seq(1, 200,10)
+results = data.frame(FNR = c(), TNR = c(), TH = c())
+start = proc.time()
+for (threshold in thresholds){
+  preds = knn(solid_train_data, solid_test_data, cl = train_cl, k=threshold)
+
+  confusion_matrix_combinations = data.frame(true_class = test_cl, pred_class = factor(preds))
+  confusion_matrix = table(confusion_matrix_combinations$true_class,  confusion_matrix_combinations$pred_class)
+  
+  TNR = confusion_matrix[1,1]/sum(confusion_matrix[1,])
+  FNR = 1 - (confusion_matrix[2,2]/sum(confusion_matrix[2,]))
+  
+  result = data.frame(FNR = c(FNR), TNR = c(TNR), TH = c(threshold))
+  results = rbind(results, result)
+}
+print("Calculation duration:")
+proc.time() - start
+
+ggplot(results) + geom_line(aes(FNR, TNR), size = 1) + geom_abline(slope = 1, intercept = 0, linetype="dashed") + labs(title = "ROC Curve for knn")
+```
+
+Some things jump out from the code.  First, knn requires complete entries; any entry in the training or test set with a missing datapoint must either be filled with dummy data or thrown out.  In this case, we choose to throw them out.  Second, the nature of the model is that you don't really "train" it; there's no model being built.  The entire dataset must be fit into memory and datapoints to classify must be compared to every single point in the training set.  This is not a naively scalable model to use, nor a particularly fast one (this model took over a minute to assess whereas the logistic model took less than a second).  The curve is hideous, but it does imply a strong ability to classify at certain points.  When k is small, it's quite accurate, around 80%.  To be clear, asjusting k is not comparable to adjusting the sensitivity of our logistic model, but it's the only significant way to tune a knn classifier.  Let's look at the confusion matrix at one of the better settings.
+
+```{r}
+  preds = knn(solid_train_data, solid_test_data, cl = train_cl, k=75)
+
+  confusion_matrix_combinations = data.frame(true_class = test_cl, pred_class = factor(preds))
+  confusion_matrix = table(confusion_matrix_combinations$true_class,  confusion_matrix_combinations$pred_class)
+
+confusion_matrix
+#Percentage of non-retained rider correctly identified
+100*confusion_matrix[1,1]/(confusion_matrix[1,1] + confusion_matrix[1,2])
+#Percentage of riders identified as non-retained who are actually not retained
+100*confusion_matrix[1,1]/(confusion_matrix[1,1] + confusion_matrix[2,1])
+ggplot(confusion_matrix_combinations) + geom_bin2d(aes(true_class, pred_class)) + labs(title="knn Confusion Matrix", x="True Class", y="Predicted Class")
+```
+
+So the knn model catches about 86% of non-retained riders (worse than the logistic model), but 76% of the riders classified as non-retained actually were (better than the logistic model).
+
+It's clear that we must prioritize our expectations of our classifier.  Which is more important?  If we had a prefect classifier, what would we do with it?  We've implicitly assumed that we're actually looking to find non-retained riders, but is it better to overestimate how many non-retains there are or is it better to underestimate?
+
+We'll try a few more models and see what we can do.  We'll try Naive Bayes (which will require some data preprocessing), support vector machines, and decision trees.  For these, we'll switch from R to Python because the Python machine learning libraries are much more concise and consistent.  Also, those libraries will save a lot of the manual coding we've done so far.
+
+First, Naive Bayes (NB).  NB only operates on categorical and discrete data, so we'll have to process our data accordingly.  We'll break down continuous variables into ranges and one-hot encode categorical variables.
+
